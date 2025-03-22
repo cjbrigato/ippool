@@ -647,3 +647,10 @@ func GetRegisteredPools() map[string]*IPPool {
 	}
 	return poolsCopy
 }
+
+func GetRegisteredPool(cidr string) (*IPPool, bool) {
+	registeredPoolsMu.Lock()
+	defer registeredPoolsMu.Unlock()
+	pool, ok := registeredPools[cidr]
+	return pool, ok
+}
