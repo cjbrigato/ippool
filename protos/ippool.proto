@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package ippoolpb;
+option go_package = "github.com/cjbrigato/ippool/pb";
+
+message PersistedPoolConfig {
+  string cidr = 1;
+  int64 lease_duration_nanos = 2;
+}
+
+message PersistedLease {
+  bytes ip = 1;
+  string mac = 2;
+  int64 expiry_nanos = 3;
+  bool sticky = 4;
+  int64 last_renew_nanos = 5;
+}
