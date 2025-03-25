@@ -7,30 +7,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cjbrigato/ippool/pb" // Assuming generated pb files are in "ippool/pb" package
+	"github.com/cjbrigato/ippool/pb"
+
 	"go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 )
-
-// --- .proto definitions (pb/ippool.proto) ---
-/*
-syntax = "proto3";
-
-package ippoolpb;
-
-message PersistedPoolConfig {
-  string cidr = 1;
-  int64 lease_duration_nanos = 2;
-}
-
-message PersistedLease {
-  bytes ip = 1;
-  string mac = 2;
-  int64 expiry_nanos = 3;
-  bool sticky = 4;
-  int64 last_renew_nanos = 5;
-}
-*/
 
 // IPPool manages a pool of IP addresses and their leases.
 type IPPool struct {
@@ -39,7 +20,7 @@ type IPPool struct {
 	availableIPs  map[string]bool  // IP address (string representation) to availability (true if available)
 	leases        map[string]Lease // MAC address to Lease
 	leaseDuration time.Duration
-	mu            sync.RWMutex // Changed from Mutex to RWMutex
+	mu            sync.RWMutex
 }
 
 // Lease represents a lease for an IP address.
@@ -79,7 +60,6 @@ func InitializeDB(path string) error {
 		if err == nil {
 			return nil
 		}
-		// TODO: Replace fmt.Printf with a proper logger
 		fmt.Printf("Error opening database (attempt %d/%d): %v, retrying in %v\n", i+1, dbRetryAttempts, err, dbRetryDelay)
 		time.Sleep(dbRetryDelay)
 	}
@@ -101,7 +81,6 @@ func LoadPoolState() error {
 		if err == nil {
 			return nil
 		}
-		// TODO: Replace fmt.Printf with a proper logger
 		fmt.Printf("Error loading pool state from DB (attempt %d/%d): %v, retrying in %v\n", i+1, dbRetryAttempts, err, dbRetryDelay)
 		time.Sleep(dbRetryDelay)
 	}
@@ -144,15 +123,13 @@ func loadPoolStateInternal() error {
 				return fmt.Errorf("error generating IPs from CIDR loaded from DB: %w", err)
 			}
 
-			// Create the pool instance. No internal lock needed here as the pool is not yet
-			// accessible concurrently.
 			pool := &IPPool{
 				ipNet:         ipNet,
 				ipRange:       ips,
 				availableIPs:  make(map[string]bool),
 				leases:        make(map[string]Lease),
 				leaseDuration: poolConfig.LeaseDuration,
-				mu:            sync.RWMutex{}, // Initialize RWMutex
+				mu:            sync.RWMutex{},
 			}
 
 			// Load available IPs
@@ -192,7 +169,7 @@ func loadPoolStateInternal() error {
 				}
 			}
 
-			registeredPools[cidr] = pool // Register the fully loaded pool
+			registeredPools[cidr] = pool
 			return nil
 		})
 	})
@@ -205,7 +182,6 @@ func SavePoolState() error {
 		if err == nil {
 			return nil
 		}
-		// TODO: Replace fmt.Printf with a proper logger
 		fmt.Printf("Error saving pool state to DB (attempt %d/%d): %v, retrying in %v\n", i+1, dbRetryAttempts, err, dbRetryDelay)
 		time.Sleep(dbRetryDelay)
 	}
@@ -213,16 +189,8 @@ func SavePoolState() error {
 }
 
 func savePoolStateInternal() error {
-	// Lock the global registry while we iterate over it
 	registeredPoolsMu.Lock()
-	// Make a copy of the pointers to avoid holding the registry lock during DB operations
-	poolsToSave := make([]*IPPool, 0, len(registeredPools))
-	cidrsToSave := make([]string, 0, len(registeredPools))
-	for cidr, pool := range registeredPools {
-		poolsToSave = append(poolsToSave, pool)
-		cidrsToSave = append(cidrsToSave, cidr)
-	}
-	registeredPoolsMu.Unlock() // Unlock the global registry
+	defer registeredPoolsMu.Unlock()
 
 	return db.Update(func(tx *bbolt.Tx) error {
 		poolsBucket, err := tx.CreateBucketIfNotExists([]byte(poolsBucketName))
@@ -230,48 +198,38 @@ func savePoolStateInternal() error {
 			return fmt.Errorf("failed to create pools bucket: %w", err)
 		}
 
-		for i, pool := range poolsToSave {
-			cidr := cidrsToSave[i]
+		for cidr, pool := range registeredPools {
 			poolBucket, err := poolsBucket.CreateBucketIfNotExists([]byte(cidr))
 			if err != nil {
 				return fmt.Errorf("failed to create pool bucket for CIDR %s: %w", cidr, err)
 			}
 
-			// Acquire read lock on the individual pool while reading its state for persistence
-			pool.mu.RLock()
-
 			// Save pool config
 			protoConfig := persistedPoolConfigToProto(PersistedPoolConfig{CIDR: cidr, LeaseDuration: pool.leaseDuration})
 			configBytes, err := proto.Marshal(protoConfig)
 			if err != nil {
-				pool.mu.RUnlock()
 				return fmt.Errorf("failed to marshal pool config for CIDR %s: %w", cidr, err)
 			}
 			if err := poolBucket.Put([]byte(poolConfigBucket), configBytes); err != nil {
-				pool.mu.RUnlock()
 				return fmt.Errorf("failed to put pool config for CIDR %s: %w", cidr, err)
 			}
 
 			// Save available IPs
 			availableIPsBucket, err := poolBucket.CreateBucketIfNotExists([]byte(availableIPsBucket))
 			if err != nil {
-				pool.mu.RUnlock()
 				return fmt.Errorf("failed to create available IPs bucket for CIDR %s: %w", cidr, err)
 			}
 			if err := availableIPsBucket.ForEach(func(k, _ []byte) error {
 				return availableIPsBucket.Delete(k)
 			}); err != nil {
-				pool.mu.RUnlock()
 				return fmt.Errorf("failed to clear available IPs bucket for CIDR %s: %w", cidr, err)
 			}
 			for ipStr, available := range pool.availableIPs {
 				availableBytes, err := encodeBool(available)
 				if err != nil {
-					pool.mu.RUnlock()
 					return fmt.Errorf("failed to encode available IP status for IP %s in CIDR %s: %w", ipStr, cidr, err)
 				}
 				if err := availableIPsBucket.Put([]byte(ipStr), availableBytes); err != nil {
-					pool.mu.RUnlock()
 					return fmt.Errorf("failed to put available IP status for IP %s in CIDR %s: %w", ipStr, cidr, err)
 				}
 			}
@@ -279,29 +237,23 @@ func savePoolStateInternal() error {
 			// Save leases
 			leasesBucket, err := poolBucket.CreateBucketIfNotExists([]byte(leasesBucket))
 			if err != nil {
-				pool.mu.RUnlock()
 				return fmt.Errorf("failed to create leases bucket for CIDR %s: %w", cidr, err)
 			}
 			if err := leasesBucket.ForEach(func(k, _ []byte) error {
 				return leasesBucket.Delete(k)
 			}); err != nil {
-				pool.mu.RUnlock()
 				return fmt.Errorf("failed to clear leases bucket for CIDR %s: %w", cidr, err)
 			}
 			for mac, lease := range pool.leases {
 				protoLease := leaseToProto(lease)
 				leaseBytes, err := proto.Marshal(protoLease)
 				if err != nil {
-					pool.mu.RUnlock()
 					return fmt.Errorf("failed to marshal lease for MAC %s in CIDR %s: %w", mac, cidr, err)
 				}
 				if err := leasesBucket.Put([]byte(mac), leaseBytes); err != nil {
-					pool.mu.RUnlock()
 					return fmt.Errorf("failed to put lease for MAC %s in CIDR %s: %w", mac, cidr, err)
 				}
 			}
-
-			pool.mu.RUnlock() // Release read lock for the pool
 		}
 		return nil
 	})
@@ -342,17 +294,8 @@ func leaseToProto(lease Lease) *pb.PersistedLease {
 }
 
 func leaseFromProto(protoLease *pb.PersistedLease) Lease {
-	ipBytes := protoLease.GetIp()
-	var ip net.IP
-	if len(ipBytes) == net.IPv4len || len(ipBytes) == net.IPv6len {
-		ip = net.IP(ipBytes)
-	} else {
-		// Handle potential unexpected byte length, maybe default or log error
-		ip = net.IPv4zero // Or some other default / error handling
-	}
-
 	return Lease{
-		IP:        ip,
+		IP:        net.IP(protoLease.GetIp()), // Assuming GetIp() returns 4 bytes
 		MAC:       protoLease.GetMac(),
 		Expiry:    time.Unix(0, protoLease.GetExpiryNanos()),
 		Sticky:    protoLease.GetSticky(),
@@ -390,7 +333,7 @@ func NewIPPool(cidr string, leaseDuration time.Duration) (*IPPool, error) {
 	// Check for overlap with existing pools
 	for registeredCIDR := range registeredPools {
 		if cidrOverlaps(cidr, registeredCIDR) {
-			return nil, fmt.Errorf("CIDR range %s overlaps with existing pool: %s", cidr, registeredCIDR)
+			return nil, fmt.Errorf("CIDR range overlaps with existing pool: %s", registeredCIDR)
 		}
 	}
 
@@ -410,22 +353,20 @@ func NewIPPool(cidr string, leaseDuration time.Duration) (*IPPool, error) {
 		availableIPs:  availableIPs,
 		leases:        make(map[string]Lease),
 		leaseDuration: leaseDuration,
-		mu:            sync.RWMutex{}, // Initialize RWMutex
+		mu:            sync.RWMutex{},
 	}
 	registeredPools[cidr] = pool
 
-	// Persist the new pool config to DB
-	if err := saveNewPoolConfigToDB(pool, cidr); err != nil {
+	// Persist the new pool to DB
+	if err := saveNewPoolToDB(pool, cidr); err != nil {
 		delete(registeredPools, cidr)
-		return nil, fmt.Errorf("failed to save new pool config to DB: %w", err)
+		return nil, fmt.Errorf("failed to save new pool to DB: %w", err)
 	}
 
 	return pool, nil
 }
 
-// saveNewPoolConfigToDB saves only the configuration part of a newly created pool.
-// The full state (available IPs, empty leases) will be saved on the next SavePoolState call.
-func saveNewPoolConfigToDB(pool *IPPool, cidr string) error {
+func saveNewPoolToDB(pool *IPPool, cidr string) error {
 	return db.Update(func(tx *bbolt.Tx) error {
 		poolsBucket, err := tx.CreateBucketIfNotExists([]byte(poolsBucketName))
 		if err != nil {
@@ -449,6 +390,7 @@ func saveNewPoolConfigToDB(pool *IPPool, cidr string) error {
 }
 
 // UnregisterIPPool unregisters an IP pool associated with the given CIDR.
+// After unregistering, the IPs in this CIDR can be used in new IP pools.
 func UnregisterIPPool(cidr string) error {
 	registeredPoolsMu.Lock()
 	defer registeredPoolsMu.Unlock()
@@ -460,8 +402,7 @@ func UnregisterIPPool(cidr string) error {
 
 	// Remove pool from DB
 	if err := deletePoolFromDB(cidr); err != nil {
-		// TODO: Decide how to handle DB delete failure. Maybe re-register the pool in memory?
-		return fmt.Errorf("failed to delete pool %s from DB: %w", cidr, err)
+		return fmt.Errorf("failed to delete pool from DB: %w", err)
 	}
 
 	return nil
@@ -471,17 +412,13 @@ func deletePoolFromDB(cidr string) error {
 	return db.Update(func(tx *bbolt.Tx) error {
 		poolsBucket := tx.Bucket([]byte(poolsBucketName))
 		if poolsBucket != nil {
-			// DeleteBucket returns ErrBucketNotFound if it doesn't exist, which is okay.
-			err := poolsBucket.DeleteBucket([]byte(cidr))
-			if err != nil && err != bbolt.ErrBucketNotFound {
-				return err
-			}
+			return poolsBucket.DeleteBucket([]byte(cidr))
 		}
 		return nil
 	})
 }
 
-// parseCIDR, generateIPsFromCIDR, lastIP, ipToInt, intToIP, cidrOverlaps (No changes needed)
+// parseCIDR, generateIPsFromCIDR, lastIP, ipToInt, intToIP, cidrOverlaps  (No changes needed from previous version)
 func parseCIDR(cidr string) (*net.IPNet, error) {
 	_, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -498,26 +435,15 @@ func generateIPsFromCIDR(ipNet *net.IPNet) ([]net.IP, error) {
 	startIP := ipNet.IP.Mask(ipNet.Mask)
 	endIP := lastIP(ipNet)
 
-	startIPInt := ipToInt(startIP)
-	endIPInt := ipToInt(endIP)
-
-	if startIPInt > endIPInt {
-		return nil, fmt.Errorf("invalid CIDR range (start > end)")
+	if ipToInt(startIP) > ipToInt(endIP) {
+		return nil, fmt.Errorf("invalid CIDR range")
 	}
 
-	// Iterate through all IPs in the range, including network and broadcast for calculation
-	for ipInt := startIPInt; ipInt <= endIPInt; ipInt++ {
+	for ipInt := ipToInt(startIP); ipInt <= ipToInt(endIP); ipInt++ {
 		ip := intToIP(ipInt)
-		// Only add usable host IPs to the pool (exclude network and broadcast)
 		if !ip.Equal(startIP) && !ip.Equal(endIP) {
 			ips = append(ips, ip)
 		}
-	}
-	if len(ips) == 0 && startIPInt != endIPInt && startIPInt+1 != endIPInt {
-		// Handle edge cases like /31 which might have specific interpretations,
-		// or small ranges where start/end are the only IPs.
-		// For now, return empty if only network/broadcast exist after filtering.
-		// Or, if you need to support /31, adjust logic here.
 	}
 	return ips, nil
 }
@@ -535,7 +461,6 @@ func lastIP(ipNet *net.IPNet) net.IP {
 func ipToInt(ip net.IP) uint32 {
 	ip4 := ip.To4()
 	if ip4 == nil {
-		// Should ideally not happen for IPv4 pools, but handle defensively
 		return 0
 	}
 	return binary.BigEndian.Uint32(ip4)
@@ -552,45 +477,41 @@ func cidrOverlaps(cidr1 string, cidr2 string) bool {
 	_, ipNet2, err2 := net.ParseCIDR(cidr2)
 
 	if err1 != nil || err2 != nil {
-		return false // Cannot determine overlap if CIDRs are invalid
+		return false
 	}
 
-	// Check if one network contains the start of the other
 	if ipNet1.Contains(ipNet2.IP) || ipNet2.Contains(ipNet1.IP) {
 		return true
 	}
-
-	// More robust check: compare numeric range
 	startIP1 := ipNet1.IP.Mask(ipNet1.Mask)
 	endIP1 := lastIP(ipNet1)
 	startIP2 := ipNet2.IP.Mask(ipNet2.Mask)
 	endIP2 := lastIP(ipNet2)
 
-	// Overlap occurs if range1 ends after range2 starts AND range2 ends after range1 starts
 	return ipToInt(endIP1) >= ipToInt(startIP2) && ipToInt(endIP2) >= ipToInt(startIP1)
 }
 
 // RequestIP requests an IP address for a given MAC address.
 func (p *IPPool) RequestIP(mac string, sticky bool) (net.IP, error) {
-	p.mu.Lock() // Acquire WRITE lock for potential modifications
+	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	now := time.Now()
-	stateChanged := false // Track if state modification requires saving
 
 	// 1. Check if there's an existing lease for this MAC
 	if lease, ok := p.leases[mac]; ok {
-		if lease.Expiry.After(now) { // Lease is still valid, renew it
+		if lease.Expiry.After(now) {
 			lease.Expiry = now.Add(p.leaseDuration)
 			lease.LastRenew = now
 			p.leases[mac] = lease
-			stateChanged = true // Lease modified
-			// No IP availability change
-		} else { // Lease expired
-			if sticky || lease.Sticky { // Sticky requested (now or before)
-				// Check availability *without* releasing first for sticky
-				if p.availableIPs[lease.IP.String()] { // Sticky requested and IP is available, re-assign
-					p.availableIPs[lease.IP.String()] = false // Mark as taken again
+			if err := SavePoolState(); err != nil {
+				fmt.Println("Error saving pool state after lease renew:", err)
+			}
+			return lease.IP, nil
+		} else {
+			if sticky || lease.Sticky {
+				if p.availableIPs[lease.IP.String()] {
+					p.availableIPs[lease.IP.String()] = false
 					newLease := Lease{
 						IP:        lease.IP,
 						MAC:       mac,
@@ -599,54 +520,35 @@ func (p *IPPool) RequestIP(mac string, sticky bool) (net.IP, error) {
 						LastRenew: now,
 					}
 					p.leases[mac] = newLease
-					stateChanged = true // Lease and availability modified
-					// Fall through to save state if changed
+					if err := SavePoolState(); err != nil {
+						fmt.Println("Error saving pool state after sticky re-assign:", err)
+					}
+					return lease.IP, nil
 				} else {
-					// Sticky requested, but IP NOT available. Log and fall through to find new IP.
-					// TODO: Replace fmt.Printf with a proper logger
 					fmt.Printf("Sticky lease IP %s for MAC %s not available, allocating new IP if possible.\n", lease.IP, mac)
-					// State hasn't changed yet, proceed to allocate new IP
 				}
 			} else {
-				// Non-sticky expired lease: release the IP back to the pool.
 				p.availableIPs[lease.IP.String()] = true
 				delete(p.leases, mac)
-				stateChanged = true // Lease and availability modified
-				// Fall through to potentially allocate a new IP
 			}
-		}
-		// If state changed (renewal, sticky re-assign, or non-sticky expiry cleanup), save and return if IP assigned
-		if stateChanged {
-			if l, ok := p.leases[mac]; ok && l.Expiry.After(now) { // Check if we successfully assigned/renewed
-				if err := SavePoolState(); err != nil {
-					// TODO: Replace fmt.Printf with a proper logger. Consider if error should be returned.
-					fmt.Println("Error saving pool state after lease operation:", err)
-				}
-				return l.IP, nil
-			}
-			// If cleanup happened but no new IP assigned yet, continue below
-		} else if lease.Expiry.After(now) { // If valid lease existed but wasn't modified (e.g., sticky IP unavailable)
-			return lease.IP, nil // Return the still valid (though maybe soon expiring) IP
 		}
 	}
 
-	// 2. No existing valid/renewable lease, or sticky failed, find a new available IP
+	// 2. No existing valid lease, find a new available IP
 	var assignedIP net.IP
 	for _, ip := range p.ipRange {
 		ipStr := ip.String()
 		if p.availableIPs[ipStr] {
 			assignedIP = ip
-			p.availableIPs[ipStr] = false // Mark as taken
-			stateChanged = true           // Availability modified
-			break                         // Found an available IP
+			p.availableIPs[ipStr] = false
+			break
 		}
 	}
 
 	if assignedIP == nil {
-		return nil, fmt.Errorf("IP pool %s exhausted", p.ipNet.String())
+		return nil, fmt.Errorf("IP pool exhausted")
 	}
 
-	// Create and store the new lease
 	newLease := Lease{
 		IP:        assignedIP,
 		MAC:       mac,
@@ -655,22 +557,15 @@ func (p *IPPool) RequestIP(mac string, sticky bool) (net.IP, error) {
 		LastRenew: now,
 	}
 	p.leases[mac] = newLease
-	stateChanged = true // Lease added
-
-	// Save state if it was changed
-	if stateChanged {
-		if err := SavePoolState(); err != nil {
-			// TODO: Replace fmt.Printf with a proper logger. Consider rollback or returning error?
-			fmt.Println("Error saving pool state after new lease assignment:", err)
-			// Even if save fails, the lease is granted in memory for now.
-		}
+	if err := SavePoolState(); err != nil {
+		fmt.Println("Error saving pool state after new lease:", err)
 	}
 	return assignedIP, nil
 }
 
 // RenewLease renews the lease for a given MAC address.
 func (p *IPPool) RenewLease(mac string) (net.IP, error) {
-	p.mu.Lock() // Acquire WRITE lock
+	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	lease, ok := p.leases[mac]
@@ -678,15 +573,10 @@ func (p *IPPool) RenewLease(mac string) (net.IP, error) {
 		return nil, fmt.Errorf("no lease found for MAC address: %s", mac)
 	}
 
-	// Allow renewal even if slightly expired, similar to RequestIP logic
-	// Could add a grace period check here if needed.
-
 	lease.Expiry = time.Now().Add(p.leaseDuration)
 	lease.LastRenew = time.Now()
-	p.leases[mac] = lease // Update the lease
-
-	if err := SavePoolState(); err != nil { // Persist state after renew
-		// TODO: Replace fmt.Printf with a proper logger. Consider returning error?
+	p.leases[mac] = lease
+	if err := SavePoolState(); err != nil {
 		fmt.Println("Error saving pool state after lease renew:", err)
 	}
 	return lease.IP, nil
@@ -694,85 +584,60 @@ func (p *IPPool) RenewLease(mac string) (net.IP, error) {
 
 // ReleaseLease releases the lease for a given MAC address, making the IP available again.
 func (p *IPPool) ReleaseLease(mac string) error {
-	p.mu.Lock() // Acquire WRITE lock
+	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	lease, ok := p.leases[mac]
 	if !ok {
-		// Consider if this should be an error or idempotent (return nil if not found)
 		return fmt.Errorf("no lease found for MAC address: %s", mac)
 	}
 
-	p.availableIPs[lease.IP.String()] = true // Mark IP as available
-	delete(p.leases, mac)                    // Remove the lease
-
-	if err := SavePoolState(); err != nil { // Persist state after release
-		// TODO: Replace fmt.Printf with a proper logger. Consider returning error?
+	p.availableIPs[lease.IP.String()] = true
+	delete(p.leases, mac)
+	if err := SavePoolState(); err != nil {
 		fmt.Println("Error saving pool state after lease release:", err)
 	}
 	return nil
 }
 
-// GetLease returns a *copy* of the lease information for a given MAC address, or nil if no lease exists.
+// GetLease returns the lease information for a given MAC address, or nil if no lease exists.
 func (p *IPPool) GetLease(mac string) *Lease {
-	p.mu.RLock() // Acquire READ lock
-	defer p.mu.RUnlock()
-
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	lease, ok := p.leases[mac]
 	if !ok {
 		return nil
 	}
-	// Return a copy to prevent external modification of the internal lease struct
-	leaseCopy := lease
-	return &leaseCopy
-}
-
-// GetAllLeases returns a deep copy of all current leases in the pool.
-func (p *IPPool) GetAllLeases() map[string]Lease {
-	p.mu.RLock() // Acquire READ lock
-	defer p.mu.RUnlock()
-
-	leasesCopy := make(map[string]Lease, len(p.leases))
-	for mac, lease := range p.leases {
-		// Simple struct copy is sufficient here as Lease fields (net.IP, time.Time)
-		// are either immutable-like or not modified after creation within this package.
-		leasesCopy[mac] = lease
-	}
-	return leasesCopy
+	return &lease
 }
 
 // CleanupExpiredLeases checks for expired leases and releases their IPs back to the pool.
 func (p *IPPool) CleanupExpiredLeases() {
-	p.mu.Lock() // Acquire WRITE lock
+	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	now := time.Now()
-	stateChanged := false // Track if state modification requires saving
+	leasesChanged := false
 	for mac, lease := range p.leases {
 		if lease.Expiry.Before(now) {
-			if !lease.Sticky { // Only cleanup non-sticky expired leases
-				// TODO: Replace fmt.Printf with a proper logger
+			if !lease.Sticky {
 				fmt.Printf("Non-sticky lease for MAC %s (IP: %s) expired, releasing IP.\n", mac, lease.IP)
-				p.availableIPs[lease.IP.String()] = true // Make IP available again
-				delete(p.leases, mac)                    // Remove the expired lease
-				stateChanged = true
+				p.availableIPs[lease.IP.String()] = true
+				delete(p.leases, mac)
+				leasesChanged = true
 			} else {
-				// TODO: Replace fmt.Printf with a proper logger
 				fmt.Printf("Sticky lease for MAC %s (IP: %s) expired, keeping lease (expired).\n", mac, lease.IP)
-				// Do NOT release IP for sticky leases. They remain in 'leases' map.
 			}
 		}
 	}
-	if stateChanged {
-		if err := SavePoolState(); err != nil { // Persist state after cleanup
-			// TODO: Replace fmt.Printf with a proper logger.
+	if leasesChanged {
+		if err := SavePoolState(); err != nil {
 			fmt.Println("Error saving pool state after cleanup:", err)
 		}
 	}
 }
 
-// GetRegisteredPools returns a map of currently registered pools (CIDR -> *IPPool).
-// This is primarily for internal use or diagnostics.
+// GetRegisteredPools for external access (e.g., cleanup routines)
 func GetRegisteredPools() map[string]*IPPool {
 	registeredPoolsMu.Lock()
 	defer registeredPoolsMu.Unlock()
@@ -788,4 +653,31 @@ func GetRegisteredPool(cidr string) (*IPPool, bool) {
 	defer registeredPoolsMu.Unlock()
 	pool, ok := registeredPools[cidr]
 	return pool, ok
+}
+
+// GetAllLeases returns a deep copy of the leases map, ensuring thread safety and efficiency.
+func (p *IPPool) GetAllLeases() map[string]Lease {
+	p.mu.RLock() // Use read lock since we're only reading
+	defer p.mu.RUnlock()
+
+	// Create a new map with the same capacity for efficiency
+	leasesCopy := make(map[string]Lease, len(p.leases))
+
+	// Deep copy each lease
+	for mac, lease := range p.leases {
+		// Create a deep copy of the IP (which is a slice)
+		ipCopy := make(net.IP, len(lease.IP))
+		copy(ipCopy, lease.IP)
+
+		// Create a new Lease struct with copied values
+		leasesCopy[mac] = Lease{
+			IP:        ipCopy,
+			MAC:       lease.MAC,
+			Expiry:    lease.Expiry,
+			Sticky:    lease.Sticky,
+			LastRenew: lease.LastRenew,
+		}
+	}
+
+	return leasesCopy
 }
